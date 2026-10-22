@@ -1,0 +1,33 @@
+name: CI/CD
+ 
+on:
+  push:
+    branches: ["master"]
+ 
+jobs:
+  validar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+ 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+          cache: pip
+ 
+      - run: python3 --version
+ 
+      - name: Instalação de ferramentas de qualidade
+        run: pip install ruff black isort
+ 
+      - name: Verificação de sintaxe
+        run: python3 -m py_compile function_app.py
+ 
+      - name: Verificar ordenação de imports
+        run: isort --check-only --diff --profile black .
+ 
+      - name: Verificar formatação
+        run: black --check --diff .
+ 
+      - name: Linting
+        run: ruff check .
