@@ -12,6 +12,71 @@ import pyodbc
 
 app = func.FunctionApp()
 
+
+def conectar_sql_destino():
+    host = os.getenv("DEST_SQL_HOST")
+    database = os.getenv("DEST_SQL_DATABASE")
+    user = os.getenv("DEST_SQL_USER")
+    password = os.getenv("DEST_SQL_PASSWORD")
+
+
+    if not all([host, database, user, password]):
+        raise ValueError("Variáveis de conexão com o SQL de destino incompletas.")
+
+
+    connection_string = (
+        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"SERVER=tcp:{host},1433;"
+        f"DATABASE={database};"
+        f"UID={user};"
+        f"PWD={password};"
+        "Encrypt=yes;"
+        "TrustServerCertificate=no;"
+        "Connection Timeout=30;"
+    )
+
+    connection = pyodbc.connect(connection_string)
+
+    return connection
+
+
+def ler_json_bronze(entidade):
+
+    storage = BlobServiceClient.from_connection_string(
+        os.environ["BRONZE_CONNECTION_STRING"]
+    )
+
+    container = storage.get_container_client("bronze")
+
+    arquivos = list(
+        container.list_blobs(
+            name_starts_with=f"itsm/{entidade}/"
+        )
+    )
+
+    if not arquivos:
+        raise FileNotFoundError(
+            f"Nenhum JSON encontrado para {entidade}"
+        )
+
+    arquivo_recente = max(
+        arquivos,
+        key=lambda arquivo: arquivo.last_modified
+    )
+
+    blob = container.get_blob_client(
+        arquivo_recente.name
+    )
+
+    conteudo = blob.download_blob().readall()
+
+    registros = json.loads(
+        conteudo.decode("utf-8")
+    )
+
+    return registros
+
+
 def salvar_bronze(cursor, entidade):
 
     colunas = [coluna[0] for coluna in cursor.description]
@@ -337,3 +402,71 @@ def extract_solicitante(myTimer: func.TimerRequest) -> None:
     
     cursor.execute("SELECT * FROM itsm.solicitante")
     salvar_bronze(cursor, "solicitante")
+
+
+
+@app.route(route="teste-destino", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
+
+def teste_destino(req: func.HttpRequest) -> func.HttpResponse:
+
+    connection = None
+
+    try:
+        connection = conectar_sql_destino()
+        cursor = connection.cursor()
+
+        cursor.execute("SELECT DB_NAME()")
+        resultado = cursor.fetchone()
+
+        nome_banco = resultado[0]
+
+        logging.info("Conexão com SQL de destino realizada.")
+
+        return func.HttpResponse(
+            f"Conectado ao banco: {nome_banco}",
+            status_code=200
+        )
+
+    except Exception:
+        logging.exception("Erro ao conectar ao SQL de destino.")
+
+        return func.HttpResponse(
+            "Erro ao conectar ao banco. Consulte os logs.",
+            status_code=500
+        )
+
+    finally:
+        if connection is not None:
+            connection.close()
+
+@app.route(
+    route="teste-json",
+    methods=["GET"],
+    auth_level=func.AuthLevel.FUNCTION
+)
+def teste_json(req: func.HttpRequest) -> func.HttpResponse:
+
+    try:
+        registros = ler_json_bronze("fila")
+
+        quantidade = len(registros)
+
+        colunas = (
+            list(registros[0].keys())
+            if registros else []
+        )
+
+        return func.HttpResponse(
+            f"Registros encontrados: {quantidade}\n"
+            f"Colunas: {', '.join(colunas)}",
+            status_code=200,
+            mimetype="text/plain"
+        )
+
+    except Exception:
+        logging.exception("Erro ao ler JSON do Storage")
+
+        return func.HttpResponse(
+            "Erro ao ler o JSON. Consulte os logs.",
+            status_code=500
+        )
