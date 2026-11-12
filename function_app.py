@@ -48,11 +48,10 @@ def ler_json_bronze(entidade):
 
     container = storage.get_container_client("bronze")
 
-    arquivos = list(
-        container.list_blobs(
-            name_starts_with=f"itsm/{entidade}/"
-        )
-    )
+    
+    arquivos = [arquivo for arquivo in container.list_blobs(name_starts_with=f"itsm/{entidade}/") 
+    if arquivo.name.lower().endswith(".json") and arquivo.size > 0]
+
 
     if not arquivos:
         raise FileNotFoundError(
@@ -70,11 +69,157 @@ def ler_json_bronze(entidade):
 
     conteudo = blob.download_blob().readall()
 
+
+    logging.info(f"Arquivo selecionado: {arquivo_recente.name}")
+
+    logging.info(f"Tamanho do arquivo: {len(conteudo)} bytes")
+
+    logging.info(f"Início do conteúdo: {repr(conteudo[:100])}")
+
     registros = json.loads(
         conteudo.decode("utf-8")
     )
 
     return registros
+
+
+
+def importar_tabelas():
+
+    tabelas = {
+        "fila": "id_fila",
+        "cliente_organizacao": "id_cliente_organizacao",
+        "categoria": "id_categoria",
+        "sla": "id_sla",
+        "analista": "id_analista",
+        "solicitante": "id_solicitante",
+        "chamados": "id_chamado",
+        "chamado_sla": "id_chamado_sla",
+        "chamado_status_historico": "id_chamado_status_historico",
+        "csat_avaliacao": "id_csat_avaliacao"
+    }
+
+    resumo = {}
+
+    for tabela, chave_primaria in tabelas.items():
+
+        logging.info(f"Iniciando importacao: {tabela}")
+
+        registros = ler_json_bronze(tabela)
+
+        if not isinstance(registros, list) or not registros:
+            raise ValueError(
+                f"JSON vazio ou invalido para {tabela}"
+            )
+
+        connection = conectar_sql_destino()
+
+        try:
+            cursor = connection.cursor()
+
+            cursor.execute(
+                """
+                SELECT COLUMN_NAME
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = 'dbo'
+                  AND TABLE_NAME = ?
+                """,
+                tabela
+            )
+
+            colunas_sql = {
+                linha[0] for linha in cursor.fetchall()
+            }
+
+            colunas = list(registros[0].keys())
+
+            if set(colunas) != colunas_sql:
+                raise ValueError(
+                    f"Colunas incompatíveis na tabela {tabela}"
+                )
+
+            if chave_primaria not in colunas:
+                raise ValueError(
+                    f"Chave primaria ausente em {tabela}"
+                )
+
+            for registro in registros:
+                if not isinstance(registro, dict):
+                    raise ValueError(
+                        f"Registro invalido em {tabela}"
+                    )
+
+                if set(registro.keys()) != set(colunas):
+                    raise ValueError(
+                        f"Registro com colunas diferentes em {tabela}"
+                    )
+
+            cursor.execute(
+                f"SELECT [{chave_primaria}] FROM dbo.[{tabela}]"
+            )
+
+            ids_existentes = {
+                linha[0] for linha in cursor.fetchall()
+            }
+
+            nomes_colunas = ", ".join(
+                f"[{coluna}]" for coluna in colunas
+            )
+
+            parametros = ", ".join(
+                "?" for _ in colunas
+            )
+
+            sql = (
+                f"INSERT INTO dbo.[{tabela}] "
+                f"({nomes_colunas}) "
+                f"VALUES ({parametros})"
+            )
+
+            novos_registros = []
+
+            for registro in registros:
+
+                identificador = registro[chave_primaria]
+
+                if identificador in ids_existentes:
+                    continue
+
+                valores = tuple(
+                    registro[coluna] for coluna in colunas
+                )
+
+                novos_registros.append(valores)
+                ids_existentes.add(identificador)
+
+            if novos_registros:
+                cursor.executemany(sql, novos_registros)
+
+            connection.commit()
+
+            inseridos = len(novos_registros)
+
+            resumo[tabela] = {
+                "lidos": len(registros),
+                "inseridos": inseridos,
+                "ignorados": len(registros) - inseridos
+            }
+
+            logging.info(
+                f"{tabela}: {inseridos} registros inseridos."
+            )
+
+        except Exception:
+            connection.rollback()
+            logging.exception(
+                f"Erro na importacao de {tabela}"
+            )
+            raise
+
+        finally:
+            connection.close()
+
+    return resumo
 
 
 def salvar_bronze(cursor, entidade):
@@ -470,3 +615,46 @@ def teste_json(req: func.HttpRequest) -> func.HttpResponse:
             "Erro ao ler o JSON. Consulte os logs.",
             status_code=500
         )
+
+
+@app.route(route="importar-tudo", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def executar_importacao(req: func.HttpRequest) -> func.HttpResponse:
+
+    try:
+        resumo = importar_tabelas()
+
+        return func.HttpResponse(
+            json.dumps(resumo, ensure_ascii=False, indent=2),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception:
+        logging.exception(
+            "Erro durante a importacao."
+        )
+
+        return func.HttpResponse(
+            "Erro na importacao. Consulte os logs.",
+            status_code=500
+        )
+
+
+@app.timer_trigger(schedule="0 30 23 * * *", arg_name="timer", run_on_startup=False, use_monitor=True)
+def importacao_diaria(timer: func.TimerRequest):
+
+    logging.info("Iniciando importacao diaria.")
+
+    try:
+        resumo = importar_tabelas()
+
+        logging.info(
+            "Importacao diaria concluida: %s",
+            json.dumps(resumo, ensure_ascii=False)
+        )
+
+    except Exception:
+        logging.exception(
+            "Erro durante a importacao diaria."
+        )
+        raise
